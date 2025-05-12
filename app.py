@@ -13,12 +13,17 @@ import json
 import requests
 from datetime import datetime, UTC
 import re
+import torch
 
 # Load environment variables
 load_dotenv()
 
-# Set CUDA visibility
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# Configure CUDA settings
+if torch.cuda.is_available():
+    torch.cuda.set_device(0)
+else:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # MongoDB setup
 client = MongoClient(os.getenv('MONGODB_URI', 'mongodb://localhost:27017/'))
@@ -29,6 +34,9 @@ chat_history_collection = db['chat_history']
 
 # OpenRouter API setup
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+if not OPENROUTER_API_KEY:
+    st.error("OpenRouter API key not found. Please set the OPENROUTER_API_KEY environment variable.")
+    st.stop()
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 def init_session_state():
@@ -102,9 +110,14 @@ def get_chat_history(subject_id):
     }).sort('timestamp', 1))
 
 def get_openrouter_response(prompt, subject_name):
+    if not OPENROUTER_API_KEY:
+        return "Error: OpenRouter API key not configured. Please set the OPENROUTER_API_KEY environment variable."
+    
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:8501",  # Required by OpenRouter
+        "X-Title": "PDF Chatbot"  # Optional but recommended
     }
     
     data = {
@@ -115,17 +128,24 @@ def get_openrouter_response(prompt, subject_name):
         ]
     }
     
-    response = requests.post(OPENROUTER_API_URL, headers=headers, json=data)
     try:
+        response = requests.post(OPENROUTER_API_URL, headers=headers, json=data)
+        response.raise_for_status()  # Raise an exception for bad status codes
         result = response.json()
         if 'choices' in result and result['choices']:
             return result['choices'][0]['message']['content']
         else:
-            st.error(f"OpenRouter API error: {result}")
-            return f"OpenRouter API error: {result}"
+            error_msg = f"OpenRouter API error: {result}"
+            st.error(error_msg)
+            return error_msg
+    except requests.exceptions.RequestException as e:
+        error_msg = f"Failed to connect to OpenRouter API: {str(e)}"
+        st.error(error_msg)
+        return error_msg
     except Exception as e:
-        st.error(f"Failed to parse OpenRouter response: {e}")
-        return f"Failed to parse OpenRouter response: {e}"
+        error_msg = f"Failed to parse OpenRouter response: {str(e)}"
+        st.error(error_msg)
+        return error_msg
 
 def display_chat_message(message, is_user=True):
     if is_user:
@@ -144,6 +164,20 @@ def display_chat_message(message, is_user=True):
             </div>
         </div>
         """, unsafe_allow_html=True)
+
+# Configure HuggingFace embeddings with CPU fallback
+def get_embeddings():
+    try:
+        return HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
+        )
+    except Exception as e:
+        print(f"Error initializing embeddings: {e}")
+        return HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'}
+        )
 
 def main():
     print("App started.")
@@ -244,11 +278,17 @@ def main():
                         texts.append(page.extract_text())
                 print("Extracted text from all PDFs.")
                 
-                # Store in Redis using HuggingFace embeddings
-                embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-                print("Created embeddings.")
-                VectorStore = Redis.from_texts(texts, embeddings, redis_url="redis://localhost:6379")
-                print("Stored texts in Redis.")
+                try:
+                    # Store in Redis using HuggingFace embeddings
+                    embeddings = get_embeddings()
+                    print("Created embeddings.")
+                    VectorStore = Redis.from_texts(texts, embeddings, redis_url="redis://localhost:6379")
+                    print("Stored texts in Redis.")
+                except Exception as e:
+                    st.error(f"Error processing PDFs: {str(e)}")
+                    VectorStore = None
+            else:
+                VectorStore = None
             
             # Chat interface
             query = st.text_input("Ask questions about your PDFs")
@@ -256,25 +296,30 @@ def main():
                 print(f"User query: {query}")
                 display_chat_message(query, True)
                 
-                results = VectorStore.similarity_search(query=query, k=3)
-                if results:
-                    # Concatenate top-k relevant chunks as context
-                    context_chunks = [r.page_content for r in results if r.page_content]
-                    context = "\n\n".join([f"Chunk {i+1}: {chunk}" for i, chunk in enumerate(context_chunks)])
-                    print("Found relevant content in PDFs. Constructing RAG prompt.")
-                    prompt = (
-                        "You are a helpful assistant. Use the following context from documents to answer the question.\n\n"
-                        f"Context from docs:\n{context}\n\nQuestion: {query}"
-                    )
-                    print("Calling OpenRouter LLM with RAG prompt.")
-                    response = get_openrouter_response(prompt, st.session_state.current_subject['name'])
-                else:
-                    print("No relevant results in PDFs, calling LLM directly.")
-                    response = get_openrouter_response(query, st.session_state.current_subject['name'])
-                
-                display_chat_message(response, False)
-                save_chat_message(st.session_state.current_subject['_id'], query, response)
-                st.session_state.chat_history = get_chat_history(st.session_state.current_subject['_id'])
+                try:
+                    if VectorStore:
+                        results = VectorStore.similarity_search(query=query, k=3)
+                        if results:
+                            context_chunks = [r.page_content for r in results if r.page_content]
+                            context = "\n\n".join([f"Chunk {i+1}: {chunk}" for i, chunk in enumerate(context_chunks)])
+                            print("Found relevant content in PDFs. Constructing RAG prompt.")
+                            prompt = (
+                                "You are a helpful assistant. Use the following context from documents to answer the question.\n\n"
+                                f"Context from docs:\n{context}\n\nQuestion: {query}"
+                            )
+                            print("Calling OpenRouter LLM with RAG prompt.")
+                            response = get_openrouter_response(prompt, st.session_state.current_subject['name'])
+                        else:
+                            print("No relevant results in PDFs, calling LLM directly.")
+                            response = get_openrouter_response(query, st.session_state.current_subject['name'])
+                    else:
+                        response = get_openrouter_response(query, st.session_state.current_subject['name'])
+                    
+                    display_chat_message(response, False)
+                    save_chat_message(st.session_state.current_subject['_id'], query, response)
+                    st.session_state.chat_history = get_chat_history(st.session_state.current_subject['_id'])
+                except Exception as e:
+                    st.error(f"Error processing query: {str(e)}")
         
         if st.sidebar.button("Logout"):
             print("User logged out.")
